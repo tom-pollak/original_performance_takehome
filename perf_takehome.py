@@ -100,9 +100,9 @@ class KernelBuilder:
 
     def build_hash(self, b, val_hash_addr, tmp1, tmp2, round, i):
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            b.alu(op1, tmp1, val_hash_addr, self.scratch_const(val1))
-            b.alu(op3, tmp2, val_hash_addr, self.scratch_const(val3))
-            b.alu(op2, val_hash_addr, tmp1, tmp2)
+            b.valu(op1, tmp1, val_hash_addr, self.scratch_const(val1))
+            b.valu(op3, tmp2, val_hash_addr, self.scratch_const(val3))
+            b.valu(op2, val_hash_addr, tmp1, tmp2)
             b.debug("compare", val_hash_addr, (round, i, "hash_stage", hi))
 
     def build_kernel(
@@ -111,7 +111,16 @@ class KernelBuilder:
         """
         Like reference_kernel2 but building actual instructions.
         Scalar implementation using only scalar ALU and load/store.
+
+        alu: 12
+        valu: 6
+        load: 2
+        store: 2
+        flow: 1
+        debug: 64
+
         """
+
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
@@ -145,26 +154,44 @@ class KernelBuilder:
 
         # Scalar scratch registers
         v_addr = self.alloc_scratch("v_addr")
-
         v_idx = self.alloc_scratch("v_idx", VLEN)  # reserves 8 consecutive scratch slots
         v_val = self.alloc_scratch("v_val", VLEN)
-
         v_node_val = self.alloc_scratch("v_node_val", VLEN)
+
+        def gather_node_val(b, v_node_val, pair):
+            """
+            2 loads per cycle, self-overwriting address with loaded value
+            Load addr at v_node_val and store it at same location
+            """
+            j = pair * 2
+            b.load("load", v_node_val + j, v_node_val + j)
+            b.load("load", v_node_val + j + 1, v_node_val + j + 1)
+
+
+        def load_and_compute_next_addr(b, load_dest, addr_reg, next_base, offset):
+            """
+            Load from current addr_reg into load_dest (vload),
+            then overwrite addr_reg with next_base + offset for next cycle.
+            """
+            # val = mem[inp_values_p + i]
+            # v_addr is written to at the end of the cycle
+            b.load("vload", load_dest, addr_reg)
+            b.alu("+", addr_reg, next_base, offset)
 
         for round in range(rounds):
             for i in range(0, batch_size, VLEN): # block=8
                 i_const = self.scratch_const(i)
+
                 # idx = mem[inp_indices_p + i]
                 with self.bundle() as b:
                     b.alu("+", v_addr, self.scratch["inp_indices_p"], i_const)
+
+                # Load idx, compute val addr
                 with self.bundle() as b:
-                    b.load("vload", v_idx, v_addr)
+                    load_and_compute_next_addr(b, v_idx, v_addr, self.scratch["inp_values_p"], i_const)
+
                 with self.bundle() as b:
                     b.debug("vcompare", v_idx, [(round, j, "idx") for j in range(i, i + VLEN)])
-
-                # val = mem[inp_values_p + i]
-                with self.bundle() as b:
-                    b.alu("+", v_addr, self.scratch["inp_values_p"], i_const)
 
                 with self.bundle() as b:
                     # node_val = mem[forest_values_p + idx]
@@ -177,11 +204,9 @@ class KernelBuilder:
                     b.debug("vcompare", v_val, [(round, j, "val") for j in range(i, i + VLEN)])
 
 
-                # 2 loads per cycle, self-overwriting address with loaded value
-                for j in range(0, VLEN, 2):
+                for j in range(VLEN//2):
                     with self.bundle() as b:
-                        b.load("load", v_node_val + j, v_node_val + j)
-                        b.load("load", v_node_val + j + 1, v_node_val + j + 1)
+                        gather_node_val(b, v_node_val, j)
 
 
                 with self.bundle() as b:
@@ -195,11 +220,14 @@ class KernelBuilder:
 
 
                 with self.bundle() as b:
-                    self.build_hash(b, tmp_val, tmp1, tmp2, round, i)
+                    self.build_hash(b, v_val, tmp1, tmp2, round, i)
 
 
                 with self.bundle() as b:
-                    b.debug("compare", tmp_val, (round, i, "hashed_val"))
+                    b.debug("compare", v_val, [(round, j, "hased_val") for j in range(i, i + VLEN)])
+
+                ### UP TO HERE ###
+
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
                 with self.bundle() as b:
                     b.alu("%", tmp1, tmp_val, two_const)
