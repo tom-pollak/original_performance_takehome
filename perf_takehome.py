@@ -144,41 +144,60 @@ class KernelBuilder:
         self.add("debug", ("comment", "Starting loop"))
 
         # Scalar scratch registers
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        v_addr = self.alloc_scratch("v_addr")
 
         v_idx = self.alloc_scratch("v_idx", VLEN)  # reserves 8 consecutive scratch slots
         v_val = self.alloc_scratch("v_val", VLEN)
+
+        v_node_val = self.alloc_scratch("v_node_val", VLEN)
 
         for round in range(rounds):
             for i in range(0, batch_size, VLEN): # block=8
                 i_const = self.scratch_const(i)
                 # idx = mem[inp_indices_p + i]
                 with self.bundle() as b:
-                    b.alu("+", tmp_addr, self.scratch["inp_indices_p"], i_const)
+                    b.alu("+", v_addr, self.scratch["inp_indices_p"], i_const)
                 with self.bundle() as b:
-                    b.load("vload", v_idx, tmp_addr)
+                    b.load("vload", v_idx, v_addr)
                 with self.bundle() as b:
                     b.debug("vcompare", v_idx, [(round, j, "idx") for j in range(i, i + VLEN)])
+
                 # val = mem[inp_values_p + i]
                 with self.bundle() as b:
-                    b.alu("+", tmp_addr, self.scratch["inp_values_p"], i_const)
+                    b.alu("+", v_addr, self.scratch["inp_values_p"], i_const)
+
                 with self.bundle() as b:
-                    b.load("vload", v_val, tmp_addr)
+                    # node_val = mem[forest_values_p + idx]
+                    for j in range(VLEN):   # ALU engine (8 of 12 slots)
+                        b.alu("+", v_node_val + j, self.scratch["forest_values_p"], v_idx + j)
+
+                    b.load("vload", v_val, v_addr)  # load engine
+
                 with self.bundle() as b:
                     b.debug("vcompare", v_val, [(round, j, "val") for j in range(i, i + VLEN)])
-                # node_val = mem[forest_values_p + idx]
+
+
+                # 2 loads per cycle, self-overwriting address with loaded value
+                for j in range(0, VLEN, 2):
+                    with self.bundle() as b:
+                        b.load("load", v_node_val + j, v_node_val + j)
+                        b.load("load", v_node_val + j + 1, v_node_val + j + 1)
+
+
                 with self.bundle() as b:
-                    b.alu("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)
-                with self.bundle() as b:
-                    b.load("load", tmp_node_val, tmp_addr)
-                with self.bundle() as b:
-                    b.debug("compare", tmp_node_val, (round, i, "node_val"))
+                    b.debug("vcompare", v_node_val, [(round, j, "node_val") for j in range(i, i + VLEN)])
+
+
                 # val = myhash(val ^ node_val)
                 with self.bundle() as b:
-                    b.alu("^", tmp_val, tmp_val, tmp_node_val)
+                    b.valu("^", v_val, v_val, v_node_val)
+
+
+
                 with self.bundle() as b:
                     self.build_hash(b, tmp_val, tmp1, tmp2, round, i)
+
+
                 with self.bundle() as b:
                     b.debug("compare", tmp_val, (round, i, "hashed_val"))
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
