@@ -17,6 +17,7 @@ We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
+from contextlib import contextmanager
 import random
 import unittest
 
@@ -37,6 +38,29 @@ from problem import (
 )
 
 
+class Bundle:
+    def __init__(self):
+        self._slots = defaultdict(list)
+
+    def alu(self, *slot):
+        self._slots["alu"].append(slot)
+
+    def valu(self, *slot):
+        self._slots["valu"].append(slot)
+
+    def load(self, *slot):
+        self._slots["load"].append(slot)
+
+    def store(self, *slot):
+        self._slots["store"].append(slot)
+
+    def flow(self, *slot):
+        self._slots["flow"].append(slot)
+
+    def debug(self, *slot):
+        self._slots["debug"].append(slot)
+
+
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
@@ -48,12 +72,12 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
-        return instrs
+    @contextmanager
+    def bundle(self):
+        b = Bundle()
+        yield b
+        if b._slots:
+            self.instrs.append(dict(b._slots))
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
@@ -126,22 +150,58 @@ class KernelBuilder:
         body = []  # array of slots
 
         # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
         tmp_node_val = self.alloc_scratch("tmp_node_val")
         tmp_addr = self.alloc_scratch("tmp_addr")
 
+        v_idx = self.alloc_scratch("v_idx", VLEN)  # reserves 8 consecutive scratch slots
+        v_val = self.alloc_scratch("v_val", VLEN)
+
+        """
+
+        ┌──────────┬───────────────────────┬──────────────────────┐
+        │          │     ALU engine        │    Load engine       │
+        │          │   (up to 12 slots)    │   (up to 2 slots)    │
+        ┼ ─────────┼───────────────────────┼──────────────────────┤
+        │ Cycle 1  │ addr0 = fvp + idx[0]  │                      │
+        │          │ addr1 = fvp + idx[1]  │       (idle)         │
+        ┼ ─────────┼───────────────────────┼──────────────────────┤
+        │ Cycle 2  │ addr2 = fvp + idx[2]  │ node[0] = mem[addr0] │
+        │          │ addr3 = fvp + idx[3]  │ node[1] = mem[addr1] │
+        ┼ ─────────┼───────────────────────┼──────────────────────┤
+        │ Cycle 3  │ addr4 = fvp + idx[4]  │ node[2] = mem[addr2] │
+        │          │ addr5 = fvp + idx[5]  │ node[3] = mem[addr3] │
+        ┼ ─────────┼───────────────────────┼──────────────────────┤
+        │ Cycle 4  │ addr6 = fvp + idx[6]  │ node[4] = mem[addr4] │
+        │          │ addr7 = fvp + idx[7]  │ node[5] = mem[addr5] │
+        ┼ ─────────┼───────────────────────┼──────────────────────┤
+        │ Cycle 5  │       (idle)          │ node[6] = mem[addr6] │
+        │          │                       │ node[7] = mem[addr7] │
+        ┴ ─────────┴───────────────────────┴──────────────────────┘
+
+
+        ┌──────────┬──────────────────────┬──────────────────────┐
+        │          │        ALU           │        Load          │
+        │ ─────────┼──────────────────────┼──────────────────────┤
+        ┼ Cycle 1  │ write addrA, addrB   │       (idle)         │
+        │ Cycle 2  │ write addrC, addrD   │ read addrA, addrB    │
+        │ Cycle 3  │ write addrA, addrB   │ read addrC, addrD    │
+        ┼ Cycle 4  │ write addrC, addrD   │ read addrA, addrB    │
+        │ Cycle 5  │       (idle)         │ read addrC, addrD    │
+        ┴ ─────────┴──────────────────────┴──────────────────────┘
+        """
+
+
         for round in range(rounds):
-            for i in range(batch_size):
+            for i in range(0, batch_size, VLEN): # block=8
                 i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
+                # idx = mem[inp_indices_p + i_const]
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
+                body.append(("load", ("vload", v_idx, tmp_addr))) # 8 lanes
+                body.append(("debug", ("vcompare", v_idx, [(round, j, "idx") for j in range(i, i + VLEN)])))
                 # val = mem[inp_values_p + i]
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
+                body.append(("load", ("vload", v_val, tmp_addr)))
+                body.append(("debug", ("vcompare", v_val, [(round, j, "idx") for j in range(i, i + VLEN)])))
                 # node_val = mem[forest_values_p + idx]
                 body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
                 body.append(("load", ("load", tmp_node_val, tmp_addr)))
