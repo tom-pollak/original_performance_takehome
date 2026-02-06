@@ -322,16 +322,21 @@ class KernelBuilder:
 
                 # LOAD
                 for step in range(6):
+                    # vload, 8alu, 4x [2load]
                     with self.bundle() as b:
                         self.do_load(b, buf, step, global_step, idx_addr, val_addr)
 
                 # COMPUTE
                 for step in range(19):
+                    # 2valu
+                    # 6x [2valu, valu]
+                    # valu, valu, flow, valu, valu, flow
                     with self.bundle() as b:
                         self.do_compute(b, buf, step, global_step)
 
                 # STORE
                 for step in range(2):
+                    # store, store
                     with self.bundle() as b:
                         self.do_store(b, buf, step, global_step)
 
