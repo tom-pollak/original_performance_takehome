@@ -188,14 +188,7 @@ class KernelBuilder:
             self.alloc_vconst(b, 2)
         with self.bundle() as b:
             self.alloc_const(b, 6)
-            # slot available for something else
-
-        # Constants for loop (8, 16, 24, ... - 0 already allocated above)
-        for i in range(VLEN, batch_size, VLEN * 2):
-            with self.bundle() as b:
-                self.alloc_const(b, i)
-                if i + VLEN < batch_size:
-                    self.alloc_const(b, i + VLEN)
+            self.alloc_const(b, VLEN)  # for address incrementing
 
         # Scratch space addresses
         init_vars = [
@@ -250,31 +243,31 @@ class KernelBuilder:
             # Any debug engine instruction is ignored by the submission simulator
             b.debug("comment", "Starting loop")
 
-        # Scalar scratch registers
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        # Scratch registers for maintained addresses
+        idx_addr = self.alloc_scratch("idx_addr")
+        val_addr = self.alloc_scratch("val_addr")
         v_idx = self.alloc_scratch("v_idx", VLEN)  # reserves 8 consecutive scratch slots
         v_val = self.alloc_scratch("v_val", VLEN)
         v_node_val = self.alloc_scratch("v_node_val", VLEN)
+        vlen_const = self.get_const(VLEN)
 
         for round in range(rounds):
+            # Reset base addresses for this round
+            with self.bundle() as b:
+                b.alu("+", idx_addr, self.scratch["inp_indices_p"], self.get_const(0))
+                b.alu("+", val_addr, self.scratch["inp_values_p"], self.get_const(0))
+
             for i in range(0, batch_size, VLEN): # block=8
-                i_const = self.get_const(i)
-
-                # idx = mem[inp_indices_p + i]
+                # Load indices from current idx_addr
                 with self.bundle() as b:
-                    b.alu("+", tmp_addr, self.scratch["inp_indices_p"], i_const)
+                    b.load("vload", v_idx, idx_addr)
 
-                # Load idx, compute val addr
-                with self.bundle() as b:
-                    load_and_compute_next_addr(b, v_idx, tmp_addr, self.scratch["inp_values_p"], i_const)
-
+                # Compute gather addrs + load values from val_addr
                 with self.bundle() as b:
                     b.debug("vcompare", v_idx, [(round, j, "idx") for j in range(i, i + VLEN)])
-                    # node_val = mem[forest_values_p + idx]
                     for j in range(VLEN):   # ALU engine (8 of 12 slots)
                         b.alu("+", v_node_val + j, self.scratch["forest_values_p"], v_idx + j)
-
-                    b.load("vload", v_val, tmp_addr)  # load engine
+                    b.load("vload", v_val, val_addr)  # load engine
 
                 for j in range(VLEN//2):
                     with self.bundle() as b:
@@ -321,16 +314,14 @@ class KernelBuilder:
                     b.flow("vselect", v_idx, v_tmp1, v_idx, self.get_vconst(0))
                 with self.bundle() as b:
                     b.debug("vcompare", v_idx, [(round, j, "wrapped_idx") for j in range(i, i + VLEN)])
-                # mem[inp_indices_p + i] = idx
+                # Store idx + advance idx_addr (self-overwriting: store reads old addr, ALU writes new)
                 with self.bundle() as b:
-                    b.alu("+", tmp_addr, self.scratch["inp_indices_p"], i_const)
+                    b.store("vstore", idx_addr, v_idx)
+                    b.alu("+", idx_addr, idx_addr, vlen_const)
+                # Store val + advance val_addr
                 with self.bundle() as b:
-                    b.store("vstore", tmp_addr, v_idx)
-                # mem[inp_values_p + i] = val
-                with self.bundle() as b:
-                    b.alu("+", tmp_addr, self.scratch["inp_values_p"], i_const)
-                with self.bundle() as b:
-                    b.store("vstore", tmp_addr, v_val)
+                    b.store("vstore", val_addr, v_val)
+                    b.alu("+", val_addr, val_addr, vlen_const)
 
         # Required to match with the yield in reference_kernel2
         with self.bundle() as b:
