@@ -222,6 +222,9 @@ class KernelBuilder:
                 b.alu("+", val_addr, self.scratch["inp_values_p"], self.get_const(0))
 
             for i in range(0, batch_size, VLEN): # block=8
+
+                ## Load stage
+
                 # Load indices from current idx_addr
                 with self.bundle() as b:
                     b.load("vload", v_idx, idx_addr)
@@ -234,8 +237,6 @@ class KernelBuilder:
                 with self.bundle() as b:
                     for j in range(VLEN):   # ALU engine (8 of 12 slots)
                         b.alu("+", v_node_val + j, self.scratch["forest_values_p"], v_idx + j)
-
-                    b.valu("*", v_idx, v_idx, self.get_vconst(2)) # later used in the hashing
 
                 with self.bundle() as b:
                     b.debug("vcompare", v_val, [(round, j, "val") for j in range(i, i + VLEN)])
@@ -252,8 +253,11 @@ class KernelBuilder:
                 with self.bundle() as b:
                     b.debug("vcompare", v_node_val, [(round, j, "node_val") for j in range(i, i + VLEN)])
 
+                ###
+
                 # val = myhash(val ^ node_val)
                 with self.bundle() as b:
+                    b.valu("*", v_idx, v_idx, self.get_vconst(2)) # later used in the hashing
                     b.valu("^", v_val, v_val, v_node_val)
 
 
