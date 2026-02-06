@@ -207,11 +207,9 @@ class KernelBuilder:
             b.flow("vselect", buf["v_idx"], buf["v_tmp1"], buf["v_idx"], self.get_vconst(0))
 
     def do_store(self, b, buf, step, global_step):
-        if step == 0:
-            b.debug(b, buf["v_idx"], "wrapped_idx", global_step)
-            b.store("vstore", buf["st_idx_addr"], buf["v_idx"])
-        else:
-            b.store("vstore", buf["st_val_addr"], buf["v_val"])
+        b.debug(b, buf["v_idx"], "wrapped_idx", global_step)
+        b.store("vstore", buf["st_idx_addr"], buf["v_idx"])
+        b.store("vstore", buf["st_val_addr"], buf["v_val"])
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -340,10 +338,9 @@ class KernelBuilder:
                         self.do_compute(b, buf, step, global_step)
 
                 # STORE
-                for step in range(2):
-                    # store, store
-                    with self.bundle() as b:
-                        self.do_store(b, buf, step, global_step)
+                # 2store
+                with self.bundle() as b:
+                    self.do_store(b, buf, step=0, global_step=global_step)
 
         # Required to match with the yield in reference_kernel2
         with self.bundle() as b:
