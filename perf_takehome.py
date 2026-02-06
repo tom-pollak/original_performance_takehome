@@ -262,23 +262,29 @@ class KernelBuilder:
                 with self.bundle() as b:
                     b.load("vload", v_idx, idx_addr)
 
-                # Compute gather addrs + load values from val_addr
                 with self.bundle() as b:
                     b.debug("vcompare", v_idx, [(round, j, "idx") for j in range(i, i + VLEN)])
+
+                # Compute gather addrs + load values from val_addr
+                with self.bundle() as b:
                     for j in range(VLEN):   # ALU engine (8 of 12 slots)
                         b.alu("+", v_node_val + j, self.scratch["forest_values_p"], v_idx + j)
                     b.load("vload", v_val, val_addr)  # load engine
 
+                    b.valu("*", v_idx, v_idx, self.get_vconst(2)) # later used in the hashing
+
+                with self.bundle() as b:
+                    b.debug("vcompare", v_val, [(round, j, "val") for j in range(i, i + VLEN)])
+
                 for j in range(VLEN//2):
                     with self.bundle() as b:
-                        if j == 0:
-                            b.debug("vcompare", v_val, [(round, j, "val") for j in range(i, i + VLEN)])
                         gather_node_val(b, v_node_val, j)
 
+                with self.bundle() as b:
+                    b.debug("vcompare", v_node_val, [(round, j, "node_val") for j in range(i, i + VLEN)])
 
                 # val = myhash(val ^ node_val)
                 with self.bundle() as b:
-                    b.debug("vcompare", v_node_val, [(round, j, "node_val") for j in range(i, i + VLEN)])
                     b.valu("^", v_val, v_val, v_node_val)
 
                 # Sequential 6-stage hash. 12 cycles total.
@@ -302,8 +308,6 @@ class KernelBuilder:
                 with self.bundle() as b:
                     b.flow("vselect", v_tmp3, v_tmp1, self.get_vconst(1), self.get_vconst(2))
                 with self.bundle() as b:
-                    b.valu("*", v_idx, v_idx, self.get_vconst(2))
-                with self.bundle() as b:
                     b.valu("+", v_idx, v_idx, v_tmp3)
                 with self.bundle() as b:
                     b.debug("vcompare", v_idx, [(round, j, "next_idx") for j in range(i, i + VLEN)])
@@ -314,6 +318,7 @@ class KernelBuilder:
                     b.flow("vselect", v_idx, v_tmp1, v_idx, self.get_vconst(0))
                 with self.bundle() as b:
                     b.debug("vcompare", v_idx, [(round, j, "wrapped_idx") for j in range(i, i + VLEN)])
+
                 # Store idx + advance idx_addr (self-overwriting: store reads old addr, ALU writes new)
                 with self.bundle() as b:
                     b.store("vstore", idx_addr, v_idx)
