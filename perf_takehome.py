@@ -116,6 +116,47 @@ class KernelBuilder:
     def get_vconst(self, val):
         return self.const_map[("v", val)]
 
+    def debug_vcompare(self, b, v, label, global_step):
+        round = global_step // self.batch_size
+        i = global_step % self.batch_size
+        b.debug("vcompare", v, [(round, j, label) for j in range(i, i + VLEN)])
+
+    def do_load(self, b, buf, step, global_step, idx_addr, val_addr):
+        """
+        LOAD stage - 6 cycles
+        ---
+        vload v_idx, v_val
+        alu compute node_val gather addresses (8/12 slots)
+        4x load cycles gathering node_val
+        ---
+        """
+        if step == 0:
+            # load v_idx, v_val
+            b.load("vload", buf["v_idx"], idx_addr)
+            b.load("vload", buf["v_val"], val_addr)
+            # also need to save store address and advance global pointer
+
+        elif step == 1:
+            self.debug_vcompare(b, buf["v_idx"], "idx", global_step)
+            self.debug_vcompare(b, buf["v_val"], "val", global_step)
+
+            # compute node_val addr
+            for i in range(VLEN):
+                b.alu("+", buf["v_node_val"] + i, self.scratch["forest_values_p"], buf["v_idx"] + i)
+
+        else:
+            i = (step - 2) * 2 # compute our current gather pair
+            # 2 loads per cycle, self-overwriting address with loaded value
+            # Load addr at v_node_val and store it at same location
+            b.load("load", buf["v_node_val"] + i, buf["v_node_val"] + i)
+            b.load("load", buf["v_node_val"] + i + 1, buf["v_node_val"] + i + 1)
+
+
+    def do_compute():
+        ...
+
+    def do_store():
+        ...
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -213,6 +254,8 @@ class KernelBuilder:
         v_idx = self.alloc_scratch("v_idx", VLEN)  # reserves 8 consecutive scratch slots
         v_val = self.alloc_scratch("v_val", VLEN)
         v_node_val = self.alloc_scratch("v_node_val", VLEN)
+
+        self.batch_size = batch_size
 
         for round in range(rounds):
             # Reset base addresses for this round
