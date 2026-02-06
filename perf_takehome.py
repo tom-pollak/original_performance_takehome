@@ -172,11 +172,48 @@ class KernelBuilder:
             b.load("load", buf["v_node_val"] + i + 1, buf["v_node_val"] + i + 1)
 
 
-    def do_compute():
-        ...
+    def do_compute(self, b, buf, step, global_step):
+        if step == 0:
+            # val = myhash(val ^ node_val)
+            self.debug_vcompare(b, buf["v_node_val"], "node_val", global_step)
+            b.valu("*", buf["v_idx"], buf["v_idx"], self.get_vconst(2))
+            b.valu("^", buf["v_val"], buf["v_val"], buf["v_node_val"])
 
-    def do_store():
-        ...
+        elif step < 13:
+            i = (step - 1)
+            stage = i // 2
+            part = i % 2
+            if part == 0:
+                op1, val1, op2, op3, val3 = HASH_STAGES[stage]
+                b.valu(op1, buf["v_tmp1"], buf["v_val"], self.get_vconst(val1))
+                b.valu(op3, buf["v_tmp2"], buf["v_val"], self.get_vconst(val3))
+            else:
+                op1, val1, op2, op3, val3 = HASH_STAGES[stage]
+                b.valu(op2, buf["v_val"], buf["v_tmp1"], buf["v_tmp2"])
+
+        # idx = 2*idx + (1 if val % 2 == 0 else 2)
+        elif step == 13:
+            self.debug_vcompare(b, buf["v_val"], "hashed_val", global_step)
+            b.valu("%", buf["v_tmp1"], buf["v_val"], self.get_vconst(2))
+        elif step == 14:
+            b.valu("==", buf["v_tmp1"], buf["v_tmp1"], self.get_vconst(0))
+        elif step == 15:
+            b.flow("vselect", buf["v_tmp3"], buf["v_tmp1"], self.get_vconst(1), self.get_vconst(2))
+        elif step == 16:
+            b.valu("+", buf["v_idx"], buf["v_idx"], buf["v_tmp3"])
+        # idx = 0 if idx >= n_nodes else idx
+        elif step == 17:
+            self.debug_vcompare(b, buf["v_idx"], "next_idx", global_step)
+            b.valu("<", buf["v_tmp1"], buf["v_idx"], self.get_vconst(self.n_nodes))
+        elif step == 18:
+            b.flow("vselect", buf["v_idx"], buf["v_tmp1"], buf["v_idx"], self.get_vconst(0))
+
+    def do_store(self, b, buf, step, global_step):
+        if step == 0:
+            b.debug(b, buf["v_idx"], "wrapped_idx", global_step)
+            b.store("vstore", buf["st_idx_addr"], buf["v_idx"])
+        else:
+            b.store("vstore", buf["st_val_addr"], buf["v_val"])
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -267,10 +304,12 @@ class KernelBuilder:
         # Scratch registers for maintained addresses
         idx_addr = self.alloc_scratch("idx_addr")
         val_addr = self.alloc_scratch("val_addr")
+
         # Single pipeline buffer - scale to N_BUFS
         buf = self.alloc_buffer(0)
 
         self.batch_size = batch_size
+        self.n_nodes = n_nodes
 
         for round in range(rounds):
             # Reset base addresses for this round
@@ -281,55 +320,20 @@ class KernelBuilder:
             for i in range(0, batch_size, VLEN):
                 global_step = round * batch_size + i
 
-                # LOAD phase - 6 cycles via do_load
+                # LOAD
                 for step in range(6):
                     with self.bundle() as b:
                         self.do_load(b, buf, step, global_step, idx_addr, val_addr)
 
-                ### Compute
-                # val = myhash(val ^ node_val)
-                with self.bundle() as b:
-                    b.debug("vcompare", buf["v_node_val"], [(round, j, "node_val") for j in range(i, i + VLEN)])
-                    b.valu("*", buf["v_idx"], buf["v_idx"], self.get_vconst(2))
-                    b.valu("^", buf["v_val"], buf["v_val"], buf["v_node_val"])
-
-                # Sequential 6-stage hash. 12 cycles total.
-                for stage in range(len(HASH_STAGES)):
+                # COMPUTE
+                for step in range(19):
                     with self.bundle() as b:
-                        op1, val1, op2, op3, val3 = HASH_STAGES[stage]
-                        b.valu(op1, buf["v_tmp1"], buf["v_val"], self.get_vconst(val1))
-                        b.valu(op3, buf["v_tmp2"], buf["v_val"], self.get_vconst(val3))
+                        self.do_compute(b, buf, step, global_step)
+
+                # STORE
+                for step in range(2):
                     with self.bundle() as b:
-                        op1, val1, op2, op3, val3 = HASH_STAGES[stage]
-                        b.valu(op2, buf["v_val"], buf["v_tmp1"], buf["v_tmp2"])
-
-                with self.bundle() as b:
-                    b.debug("vcompare", buf["v_val"], [(round, j, "hashed_val") for j in range(i, i + VLEN)])
-
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                with self.bundle() as b:
-                    b.valu("%", buf["v_tmp1"], buf["v_val"], self.get_vconst(2))
-                with self.bundle() as b:
-                    b.valu("==", buf["v_tmp1"], buf["v_tmp1"], self.get_vconst(0))
-                with self.bundle() as b:
-                    b.flow("vselect", buf["v_tmp3"], buf["v_tmp1"], self.get_vconst(1), self.get_vconst(2))
-                with self.bundle() as b:
-                    b.valu("+", buf["v_idx"], buf["v_idx"], buf["v_tmp3"])
-                with self.bundle() as b:
-                    b.debug("vcompare", buf["v_idx"], [(round, j, "next_idx") for j in range(i, i + VLEN)])
-                # idx = 0 if idx >= n_nodes else idx
-                with self.bundle() as b:
-                    b.valu("<", buf["v_tmp1"], buf["v_idx"], self.get_vconst(n_nodes))
-                with self.bundle() as b:
-                    b.flow("vselect", buf["v_idx"], buf["v_tmp1"], buf["v_idx"], self.get_vconst(0))
-                with self.bundle() as b:
-                    b.debug("vcompare", buf["v_idx"], [(round, j, "wrapped_idx") for j in range(i, i + VLEN)])
-
-                # STORE - use saved addresses from do_load step 0
-                with self.bundle() as b:
-                    b.store("vstore", buf["st_idx_addr"], buf["v_idx"])
-                with self.bundle() as b:
-                    b.store("vstore", buf["st_val_addr"], buf["v_val"])
+                        self.do_store(b, buf, step, global_step)
 
         # Required to match with the yield in reference_kernel2
         with self.bundle() as b:
