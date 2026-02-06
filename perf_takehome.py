@@ -213,7 +213,6 @@ class KernelBuilder:
         v_idx = self.alloc_scratch("v_idx", VLEN)  # reserves 8 consecutive scratch slots
         v_val = self.alloc_scratch("v_val", VLEN)
         v_node_val = self.alloc_scratch("v_node_val", VLEN)
-        vlen_const = self.get_const(VLEN)
 
         for round in range(rounds):
             # Reset base addresses for this round
@@ -223,7 +222,8 @@ class KernelBuilder:
 
             for i in range(0, batch_size, VLEN): # block=8
 
-                ## Load stage
+                ## Load stage - 6 cycles: vload | alu gather addr | 4x gather
+                # ALU not used in compute stage, only load and store
 
                 # Load indices from current idx_addr
                 with self.bundle() as b:
@@ -241,7 +241,7 @@ class KernelBuilder:
                 with self.bundle() as b:
                     b.debug("vcompare", v_val, [(round, j, "val") for j in range(i, i + VLEN)])
 
-                for j in range(0, VLEN, 2):
+                for j in range(0, VLEN, 2): # 4 cycle for gather
                     with self.bundle() as b:
                         """
                         2 loads per cycle, self-overwriting address with loaded value
@@ -253,7 +253,7 @@ class KernelBuilder:
                 with self.bundle() as b:
                     b.debug("vcompare", v_node_val, [(round, j, "node_val") for j in range(i, i + VLEN)])
 
-                ###
+                ### Compute
 
                 # val = myhash(val ^ node_val)
                 with self.bundle() as b:
@@ -284,8 +284,6 @@ class KernelBuilder:
                 with self.bundle() as b:
                     b.debug("vcompare", v_val, [(round, j, "hashed_val") for j in range(i, i + VLEN)])
 
-                ### UP TO HERE ###
-
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
                 with self.bundle() as b:
                     b.valu("%", v_tmp1, v_val, self.get_vconst(2))
@@ -305,14 +303,16 @@ class KernelBuilder:
                 with self.bundle() as b:
                     b.debug("vcompare", v_idx, [(round, j, "wrapped_idx") for j in range(i, i + VLEN)])
 
+                # Store
+
                 # Store idx + advance idx_addr (self-overwriting: store reads old addr, ALU writes new)
                 with self.bundle() as b:
                     b.store("vstore", idx_addr, v_idx)
-                    b.alu("+", idx_addr, idx_addr, vlen_const)
+                    b.alu("+", idx_addr, idx_addr, self.get_const(VLEN))
                 # Store val + advance val_addr
                 with self.bundle() as b:
                     b.store("vstore", val_addr, v_val)
-                    b.alu("+", val_addr, val_addr, vlen_const)
+                    b.alu("+", val_addr, val_addr, self.get_const(VLEN))
 
         # Required to match with the yield in reference_kernel2
         with self.bundle() as b:
