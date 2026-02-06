@@ -251,7 +251,7 @@ class KernelBuilder:
             b.debug("comment", "Starting loop")
 
         # Scalar scratch registers
-        v_addr = self.alloc_scratch("v_addr")
+        tmp_addr = self.alloc_scratch("tmp_addr")
         v_idx = self.alloc_scratch("v_idx", VLEN)  # reserves 8 consecutive scratch slots
         v_val = self.alloc_scratch("v_val", VLEN)
         v_node_val = self.alloc_scratch("v_node_val", VLEN)
@@ -262,11 +262,11 @@ class KernelBuilder:
 
                 # idx = mem[inp_indices_p + i]
                 with self.bundle() as b:
-                    b.alu("+", v_addr, self.scratch["inp_indices_p"], i_const)
+                    b.alu("+", tmp_addr, self.scratch["inp_indices_p"], i_const)
 
                 # Load idx, compute val addr
                 with self.bundle() as b:
-                    load_and_compute_next_addr(b, v_idx, v_addr, self.scratch["inp_values_p"], i_const)
+                    load_and_compute_next_addr(b, v_idx, tmp_addr, self.scratch["inp_values_p"], i_const)
 
                 with self.bundle() as b:
                     b.debug("vcompare", v_idx, [(round, j, "idx") for j in range(i, i + VLEN)])
@@ -274,7 +274,7 @@ class KernelBuilder:
                     for j in range(VLEN):   # ALU engine (8 of 12 slots)
                         b.alu("+", v_node_val + j, self.scratch["forest_values_p"], v_idx + j)
 
-                    b.load("vload", v_val, v_addr)  # load engine
+                    b.load("vload", v_val, tmp_addr)  # load engine
 
                 for j in range(VLEN//2):
                     with self.bundle() as b:
@@ -323,14 +323,14 @@ class KernelBuilder:
                     b.debug("vcompare", v_idx, [(round, j, "wrapped_idx") for j in range(i, i + VLEN)])
                 # mem[inp_indices_p + i] = idx
                 with self.bundle() as b:
-                    b.alu("+", v_addr, self.scratch["inp_indices_p"], i_const)
+                    b.alu("+", tmp_addr, self.scratch["inp_indices_p"], i_const)
                 with self.bundle() as b:
-                    b.store("vstore", v_addr, v_idx)
+                    b.store("vstore", tmp_addr, v_idx)
                 # mem[inp_values_p + i] = val
                 with self.bundle() as b:
-                    b.alu("+", v_addr, self.scratch["inp_values_p"], i_const)
+                    b.alu("+", tmp_addr, self.scratch["inp_values_p"], i_const)
                 with self.bundle() as b:
-                    b.store("vstore", v_addr, v_val)
+                    b.store("vstore", tmp_addr, v_val)
 
         # Required to match with the yield in reference_kernel2
         with self.bundle() as b:
