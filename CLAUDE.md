@@ -60,26 +60,37 @@ Header (7 words): rounds, n_nodes, batch_size, forest_height, forest_values_p, i
 ## Current State
 
 Work in progress: migrating from scalar to SIMD (VLEN=8) vectorized kernel.
-- Loads for indices and values use `vload` (8 contiguous elements) -- DONE
-- Node value loads (gather) still need vectorizing -- NEXT STEP (see below)
-- Hash, branch logic, stores still need converting to `valu`/`vselect`/`vstore`
-- `tmp_idx` and `tmp_val` references are currently broken (removed scalars, not yet replaced with vector equivalents)
 
-### Next: Gather (node_val loads)
+### Completed (lines 181-227)
+- **vload for indices and values** — 8 contiguous elements per load
+- **Gather for node_val** — self-overwriting scalar loads (see technique below)
+- **XOR** — `valu("^", v_val, v_val, v_node_val)`
+- **Hash** — `build_hash` now uses `valu` ops (but still passes scalar `tmp1`, `tmp2` — needs vector temps)
 
-The gather loads 8 node values from non-contiguous tree addresses. No vector gather instruction exists, so we need 8 scalar loads. Plan:
+### Helper functions defined
+- `gather_node_val(b, v_node_val, pair)` — adds 2 scalar loads per call (load engine limit)
+- `load_and_compute_next_addr(b, load_dest, addr_reg, next_base, offset)` — overlaps vload with next address computation
 
-1. Allocate `v_node_val` (VLEN scratch slots) for results and 8 scratch slots for addresses (`gather_addr`)
-2. **Cycle 1** (one bundle): 8 ALU ops computing all addresses: `gather_addr[j] = forest_values_p + v_idx[j]` for j=0..7. All 8 fit in one cycle (ALU has 12 slots).
-3. **Cycles 2-5** (four bundles): 2 loads per cycle into `v_node_val[j]`. Load engine limit is 2 per cycle, so 8 loads = 4 cycles.
+### Self-overwriting trick (gather)
+Uses same scratch slots for address and result: `load v_node_val[j], v_node_val[j]`
+- Reads use `core.scratch` (old value = address)
+- Writes go to `scratch_write` (applied at end of cycle = loaded value)
+- 8 ALU address ops merged with v_val vload (free cycle)
+- 4 bundles × 2 loads = 4 cycles for gather
 
-Total: 5 cycles for the gather. After this, `v_node_val` is a full vector ready for `valu` ops.
+### Next: Vectorize remaining code (lines 229-260)
+Remaining scalar code references undefined `tmp_val`, `tmp_idx`, `tmp_addr`. Need to convert:
+- **Branch decision** (`% 2`, select): use `valu` + `flow("vselect", ...)`
+- **Wrap check** (`idx >= n_nodes`): use `valu` + `flow("vselect", ...)`
+- **Store back**: use `store("vstore", addr, data)` — addr is scalar, data is vector
+- **Constants for valu**: need vector versions via `valu("vbroadcast", v_const, scalar_const)`
 
-After the gather, remaining steps to vectorize:
-- XOR + hash: use `valu` ops (process 8 elements at once)
-- Branch decision (% 2, select): use `valu` + `vselect`
-- Wrap check: use `valu` + `vselect`
-- Store back: use `vstore` (contiguous)
+### Future: Software pipelining
+Batch iterations within a round are independent — can overlap:
+- **Load phase** (vloads + gather) uses load engine, ALU mostly idle
+- **Compute phase** (hash + branch + wrap) uses valu, load engine idle
+- Pipeline: load batch `i+1` while computing batch `i`
+- Requires double-buffered scratch vectors (`v_idx_A`/`v_idx_B`, etc.)
 
 ## Critical Rules
 

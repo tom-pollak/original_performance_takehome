@@ -1,3 +1,4 @@
+# fmt: off
 """
 # Anthropic's Original Performance Engineering Take-home (Release version)
 
@@ -91,19 +92,30 @@ class KernelBuilder:
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
-    def scratch_const(self, val, name=None):
+    def alloc_const(self, b, val, name=None):
+        """Allocate and load a scalar constant into the given bundle."""
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
+            b.load("const", addr, val)
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash(self, b, val_hash_addr, tmp1, tmp2, round, i):
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            b.valu(op1, tmp1, val_hash_addr, self.scratch_const(val1))
-            b.valu(op3, tmp2, val_hash_addr, self.scratch_const(val3))
-            b.valu(op2, val_hash_addr, tmp1, tmp2)
-            b.debug("compare", val_hash_addr, (round, i, "hash_stage", hi))
+    def alloc_vconst(self, b, val, name=None):
+        """Allocate and broadcast a vector constant into the given bundle."""
+        key = ("v", val)
+        if key not in self.const_map:
+            scalar_addr = self.get_const(val)  # must already exist
+            v_addr = self.alloc_scratch(name, VLEN)
+            b.valu("vbroadcast", v_addr, scalar_addr)
+            self.const_map[key] = v_addr
+        return self.const_map[key]
+
+    def get_const(self, val):
+        return self.const_map[val]
+
+    def get_vconst(self, val):
+        return self.const_map[("v", val)]
+
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -120,10 +132,70 @@ class KernelBuilder:
         debug: 64
 
         """
+        def gather_node_val(b, v_node_val, pair):
+            """
+            2 loads per cycle, self-overwriting address with loaded value
+            Load addr at v_node_val and store it at same location
+            """
+            j = pair * 2
+            b.load("load", v_node_val + j, v_node_val + j)
+            b.load("load", v_node_val + j + 1, v_node_val + j + 1)
 
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
+        def load_and_compute_next_addr(b, load_dest, addr_reg, next_base, offset):
+            """
+            Load from current addr_reg into load_dest (vload),
+            then overwrite addr_reg with next_base + offset for next cycle.
+            """
+            # val = mem[inp_values_p + i]
+            # v_addr is written to at the end of the cycle
+            b.load("vload", load_dest, addr_reg)
+            b.alu("+", addr_reg, next_base, offset)
+
+        def hash_p1(b, stage, v_val, v_tmp1, v_tmp2):
+            """
+            Hash stage first half: compute temps from val. (2 valu slots)
+            Can run in parallel with loads or other work.
+            """
+            op1, val1, op2, op3, val3 = HASH_STAGES[stage]
+            b.valu(op1, v_tmp1, v_val, self.get_vconst(val1))
+            b.valu(op3, v_tmp2, v_val, self.get_vconst(val3))
+
+        def hash_p2(b, stage, v_val, v_tmp1, v_tmp2):
+            """
+            Hash stage second half: combine temps into val. (1 valu slot)
+            Depends on p1 completing in previous cycle.
+            """
+            op1, val1, op2, op3, val3 = HASH_STAGES[stage]
+            b.valu(op2, v_val, v_tmp1, v_tmp2)
+
+
+        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
+        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
+        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
+
+        tmp1 = self.alloc_scratch("tmp1")  # scalar temp for init
+
+        # Constants for init_vars (indices 0-6)
+        with self.bundle() as b:
+            self.alloc_const(b, 0)
+            self.alloc_const(b, 1)
+        with self.bundle() as b:
+            self.alloc_const(b, 2)
+            self.alloc_const(b, 3)
+        with self.bundle() as b:
+            self.alloc_const(b, 4)
+            self.alloc_const(b, 5)
+        with self.bundle() as b:
+            self.alloc_const(b, 6)
+            # slot available for something else
+
+        # Constants for loop (8, 16, 24, ... - 0 already allocated above)
+        for i in range(VLEN, batch_size, VLEN * 2):
+            with self.bundle() as b:
+                self.alloc_const(b, i)
+                if i + VLEN < batch_size:
+                    self.alloc_const(b, i + VLEN)
+
         # Scratch space addresses
         init_vars = [
             "rounds",
@@ -136,21 +208,41 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # Constants 0-6 are already allocated from earlier
+        # Now pack memory loads, 2 per cycle
+        for chunk in range(0, len(init_vars), 2):
+            with self.bundle() as b:
+                for i, v in enumerate(init_vars[chunk:chunk+2], start=chunk):
+                    b.load("load", self.scratch[v], self.get_const(i))
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+        ### HASH CONSTS
+        hash_consts = set()
+        for _, val1, _, _, val3 in HASH_STAGES:
+            hash_consts.add(val1)
+            hash_consts.add(val3)
+        hash_consts = list(hash_consts)
+
+        ## To make vconsts, we must first load them as consts
+        for chunk in range(0, len(hash_consts), 2): # 2 loads per cycle
+            with self.bundle() as b:
+                for val in hash_consts[chunk:chunk+2]:
+                    self.alloc_const(b, val)
+
+        for chunk in range(0, len(hash_consts), 6): # 6 valu per cycle
+            with self.bundle() as b:
+                for val in hash_consts[chunk:chunk+6]:
+                    self.alloc_vconst(b, val)
+        ###
+
+        with self.bundle() as b:
+            # Pause instructions are matched up with yield statements in the reference
+            # kernel to let you debug at intermediate steps. The testing harness in this
+            # file requires these match up to the reference kernel's yields, but the
+            # submission harness ignores them.
+            b.flow("pause")
+            # Any debug engine instruction is ignored by the submission simulator
+            b.debug("comment", "Starting loop")
 
         # Scalar scratch registers
         v_addr = self.alloc_scratch("v_addr")
@@ -158,29 +250,9 @@ class KernelBuilder:
         v_val = self.alloc_scratch("v_val", VLEN)
         v_node_val = self.alloc_scratch("v_node_val", VLEN)
 
-        def gather_node_val(b, v_node_val, pair):
-            """
-            2 loads per cycle, self-overwriting address with loaded value
-            Load addr at v_node_val and store it at same location
-            """
-            j = pair * 2
-            b.load("load", v_node_val + j, v_node_val + j)
-            b.load("load", v_node_val + j + 1, v_node_val + j + 1)
-
-
-        def load_and_compute_next_addr(b, load_dest, addr_reg, next_base, offset):
-            """
-            Load from current addr_reg into load_dest (vload),
-            then overwrite addr_reg with next_base + offset for next cycle.
-            """
-            # val = mem[inp_values_p + i]
-            # v_addr is written to at the end of the cycle
-            b.load("vload", load_dest, addr_reg)
-            b.alu("+", addr_reg, next_base, offset)
-
         for round in range(rounds):
             for i in range(0, batch_size, VLEN): # block=8
-                i_const = self.scratch_const(i)
+                i_const = self.get_const(i)
 
                 # idx = mem[inp_indices_p + i]
                 with self.bundle() as b:
@@ -192,45 +264,40 @@ class KernelBuilder:
 
                 with self.bundle() as b:
                     b.debug("vcompare", v_idx, [(round, j, "idx") for j in range(i, i + VLEN)])
-
-                with self.bundle() as b:
                     # node_val = mem[forest_values_p + idx]
                     for j in range(VLEN):   # ALU engine (8 of 12 slots)
                         b.alu("+", v_node_val + j, self.scratch["forest_values_p"], v_idx + j)
 
                     b.load("vload", v_val, v_addr)  # load engine
 
-                with self.bundle() as b:
-                    b.debug("vcompare", v_val, [(round, j, "val") for j in range(i, i + VLEN)])
-
-
                 for j in range(VLEN//2):
                     with self.bundle() as b:
+                        if j == 0:
+                            b.debug("vcompare", v_val, [(round, j, "val") for j in range(i, i + VLEN)])
                         gather_node_val(b, v_node_val, j)
-
-
-                with self.bundle() as b:
-                    b.debug("vcompare", v_node_val, [(round, j, "node_val") for j in range(i, i + VLEN)])
 
 
                 # val = myhash(val ^ node_val)
                 with self.bundle() as b:
+                    b.debug("vcompare", v_node_val, [(round, j, "node_val") for j in range(i, i + VLEN)])
                     b.valu("^", v_val, v_val, v_node_val)
 
-
+                # Sequential 6-stage hash. 12 cycles total.
+                # TODO: Pipeline with loads or interleave batches to use spare slots.
+                for stage in range(len(HASH_STAGES)):
+                    with self.bundle() as b:
+                        hash_p1(b, stage, v_val, v_tmp1, v_tmp2)
+                    with self.bundle() as b:
+                        hash_p2(b, stage, v_val, v_tmp1, v_tmp2)
 
                 with self.bundle() as b:
-                    self.build_hash(b, v_val, tmp1, tmp2, round, i)
-
-
-                with self.bundle() as b:
-                    b.debug("compare", v_val, [(round, j, "hased_val") for j in range(i, i + VLEN)])
+                    b.debug("vcompare", v_val, [(round, j, "hashed_val") for j in range(i, i + VLEN)])
 
                 ### UP TO HERE ###
 
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
                 with self.bundle() as b:
-                    b.alu("%", tmp1, tmp_val, two_const)
+                    b.alu("%", tmp1, v_val, two_const)
                 with self.bundle() as b:
                     b.alu("==", tmp1, tmp1, zero_const)
                 with self.bundle() as b:
