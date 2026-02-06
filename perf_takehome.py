@@ -176,7 +176,6 @@ class KernelBuilder:
         if step == 0:
             # val = myhash(val ^ node_val)
             self.debug_vcompare(b, buf["v_node_val"], "node_val", global_step)
-            b.valu("*", buf["v_idx"], buf["v_idx"], self.get_vconst(2))
             b.valu("^", buf["v_val"], buf["v_val"], buf["v_node_val"])
 
         elif step < 13:
@@ -191,21 +190,20 @@ class KernelBuilder:
                 op1, val1, op2, op3, val3 = HASH_STAGES[stage]
                 b.valu(op2, buf["v_val"], buf["v_tmp1"], buf["v_tmp2"])
 
-        # idx = 2*idx + (1 if val % 2 == 0 else 2)
+        # idx = 2*idx + ((val % 2) + 1)  -- note: 0→1, 1→2 replaces eq+vselect
         elif step == 13:
             self.debug_vcompare(b, buf["v_val"], "hashed_val", global_step)
             b.valu("%", buf["v_tmp1"], buf["v_val"], self.get_vconst(2))
+            b.valu("*", buf["v_idx"], buf["v_idx"], self.get_vconst(2))
         elif step == 14:
-            b.valu("==", buf["v_tmp1"], buf["v_tmp1"], self.get_vconst(0))
+            b.valu("+", buf["v_tmp1"], buf["v_tmp1"], self.get_vconst(1))
         elif step == 15:
-            b.flow("vselect", buf["v_tmp3"], buf["v_tmp1"], self.get_vconst(1), self.get_vconst(2))
-        elif step == 16:
-            b.valu("+", buf["v_idx"], buf["v_idx"], buf["v_tmp3"])
+            b.valu("+", buf["v_idx"], buf["v_idx"], buf["v_tmp1"])
         # idx = 0 if idx >= n_nodes else idx
-        elif step == 17:
+        elif step == 16:
             self.debug_vcompare(b, buf["v_idx"], "next_idx", global_step)
             b.valu("<", buf["v_tmp1"], buf["v_idx"], self.get_vconst(self.n_nodes))
-        elif step == 18:
+        elif step == 17:
             b.flow("vselect", buf["v_idx"], buf["v_tmp1"], buf["v_idx"], self.get_vconst(0))
 
     def do_store(self, b, buf, step, global_step):
@@ -311,6 +309,13 @@ class KernelBuilder:
         self.batch_size = batch_size
         self.n_nodes = n_nodes
 
+        #  off | valu(6) | Batches
+        #   0  |    3    | L0, C0, C6, C12, S0
+        #   1  |    6    | L1, C1, C7, C13, S1
+        #   2  |    3    | L2, C2, C8, C14
+        #   3  |    5    | L3, C3, C9, C15
+        #   4  |    3    | L4, C4, C10, C16
+        #   5  |    4    | L5, C5, C11, C17
         for round in range(rounds):
             # Reset base addresses for this round
             with self.bundle() as b:
@@ -327,10 +332,10 @@ class KernelBuilder:
                         self.do_load(b, buf, step, global_step, idx_addr, val_addr)
 
                 # COMPUTE
-                for step in range(19):
-                    # 2valu
-                    # 6x [2valu, valu]
-                    # valu, valu, flow, valu, valu, flow
+                for step in range(18):
+                    # 1valu (XOR)
+                    # 6x [2valu, 1valu] (hash)
+                    # 2valu (mod+mul), 1valu (+1), 1valu (add), 1valu (lt), 1flow (wrap)
                     with self.bundle() as b:
                         self.do_compute(b, buf, step, global_step)
 
