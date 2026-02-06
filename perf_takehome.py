@@ -173,8 +173,6 @@ class KernelBuilder:
         v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
         v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
 
-        tmp1 = self.alloc_scratch("tmp1")  # scalar temp for init
-
         # Constants for init_vars (indices 0-6)
         with self.bundle() as b:
             self.alloc_const(b, 0)
@@ -182,9 +180,12 @@ class KernelBuilder:
         with self.bundle() as b:
             self.alloc_const(b, 2)
             self.alloc_const(b, 3)
+            self.alloc_vconst(b, 0) # alloc vconst for 0,1,2
+            self.alloc_vconst(b, 1)
         with self.bundle() as b:
             self.alloc_const(b, 4)
             self.alloc_const(b, 5)
+            self.alloc_vconst(b, 2)
         with self.bundle() as b:
             self.alloc_const(b, 6)
             # slot available for something else
@@ -233,7 +234,12 @@ class KernelBuilder:
             with self.bundle() as b:
                 for val in hash_consts[chunk:chunk+6]:
                     self.alloc_vconst(b, val)
-        ###
+
+        ### n_nodes as vector const for wrap comparison
+        with self.bundle() as b:
+            self.alloc_const(b, n_nodes, "n_nodes_const")
+        with self.bundle() as b:
+            self.alloc_vconst(b, n_nodes, "v_n_nodes")
 
         with self.bundle() as b:
             # Pause instructions are matched up with yield statements in the reference
@@ -297,34 +303,34 @@ class KernelBuilder:
 
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
                 with self.bundle() as b:
-                    b.alu("%", tmp1, v_val, two_const)
+                    b.valu("%", v_tmp1, v_val, self.get_vconst(2))
                 with self.bundle() as b:
-                    b.alu("==", tmp1, tmp1, zero_const)
+                    b.valu("==", v_tmp1, v_tmp1, self.get_vconst(0))
                 with self.bundle() as b:
-                    b.flow("select", tmp3, tmp1, one_const, two_const)
+                    b.flow("vselect", v_tmp3, v_tmp1, self.get_vconst(1), self.get_vconst(2))
                 with self.bundle() as b:
-                    b.alu("*", tmp_idx, tmp_idx, two_const)
+                    b.valu("*", v_idx, v_idx, self.get_vconst(2))
                 with self.bundle() as b:
-                    b.alu("+", tmp_idx, tmp_idx, tmp3)
+                    b.valu("+", v_idx, v_idx, v_tmp3)
                 with self.bundle() as b:
-                    b.debug("compare", tmp_idx, (round, i, "next_idx"))
+                    b.debug("vcompare", v_idx, [(round, j, "next_idx") for j in range(i, i + VLEN)])
                 # idx = 0 if idx >= n_nodes else idx
                 with self.bundle() as b:
-                    b.alu("<", tmp1, tmp_idx, self.scratch["n_nodes"])
+                    b.valu("<", v_tmp1, v_idx, self.get_vconst(n_nodes))
                 with self.bundle() as b:
-                    b.flow("select", tmp_idx, tmp1, tmp_idx, zero_const)
+                    b.flow("vselect", v_idx, v_tmp1, v_idx, self.get_vconst(0))
                 with self.bundle() as b:
-                    b.debug("compare", tmp_idx, (round, i, "wrapped_idx"))
+                    b.debug("vcompare", v_idx, [(round, j, "wrapped_idx") for j in range(i, i + VLEN)])
                 # mem[inp_indices_p + i] = idx
                 with self.bundle() as b:
-                    b.alu("+", tmp_addr, self.scratch["inp_indices_p"], i_const)
+                    b.alu("+", v_addr, self.scratch["inp_indices_p"], i_const)
                 with self.bundle() as b:
-                    b.store("store", tmp_addr, tmp_idx)
+                    b.store("vstore", v_addr, v_idx)
                 # mem[inp_values_p + i] = val
                 with self.bundle() as b:
-                    b.alu("+", tmp_addr, self.scratch["inp_values_p"], i_const)
+                    b.alu("+", v_addr, self.scratch["inp_values_p"], i_const)
                 with self.bundle() as b:
-                    b.store("store", tmp_addr, tmp_val)
+                    b.store("vstore", v_addr, v_val)
 
         # Required to match with the yield in reference_kernel2
         with self.bundle() as b:
