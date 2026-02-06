@@ -121,11 +121,25 @@ class KernelBuilder:
         i = global_step % self.batch_size
         b.debug("vcompare", v, [(round, j, label) for j in range(i, i + VLEN)])
 
+    def alloc_buffer(self, buf_id):
+        p = f"b{buf_id}_"
+        return {
+            "v_idx": self.alloc_scratch(p + "v_idx", VLEN),
+            "v_val": self.alloc_scratch(p + "v_val", VLEN),
+            "v_node_val": self.alloc_scratch(p + "v_node_val", VLEN),
+            "v_tmp1": self.alloc_scratch(p + "v_tmp1", VLEN),
+            "v_tmp2": self.alloc_scratch(p + "v_tmp2", VLEN),
+            "v_tmp3": self.alloc_scratch(p + "v_tmp3", VLEN),
+            "st_idx_addr": self.alloc_scratch(p + "st_idx_addr"),
+            "st_val_addr": self.alloc_scratch(p + "st_val_addr"),
+        }
+
+
     def do_load(self, b, buf, step, global_step, idx_addr, val_addr):
         """
         LOAD stage - 6 cycles
         ---
-        vload v_idx, v_val
+        vload v_idx, v_val + save addresses & advance global pointers for next cycle
         alu compute node_val gather addresses (8/12 slots)
         4x load cycles gathering node_val
         ---
@@ -134,7 +148,13 @@ class KernelBuilder:
             # load v_idx, v_val
             b.load("vload", buf["v_idx"], idx_addr)
             b.load("vload", buf["v_val"], val_addr)
-            # also need to save store address and advance global pointer
+            ## operates on old data
+            # save store addresses
+            b.alu("+", buf["st_idx_addr"], idx_addr, self.get_const(0))
+            b.alu("+", buf["st_val_addr"], val_addr, self.get_const(0))
+            # advance global pointers
+            b.alu("+", idx_addr, idx_addr, self.get_const(VLEN))
+            b.alu("+", val_addr, val_addr, self.get_const(VLEN))
 
         elif step == 1:
             self.debug_vcompare(b, buf["v_idx"], "idx", global_step)
@@ -173,10 +193,6 @@ class KernelBuilder:
         debug: 64
 
         """
-
-        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
-        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
-        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
 
         # Constants for init_vars (indices 0-6)
         with self.bundle() as b:
@@ -251,9 +267,8 @@ class KernelBuilder:
         # Scratch registers for maintained addresses
         idx_addr = self.alloc_scratch("idx_addr")
         val_addr = self.alloc_scratch("val_addr")
-        v_idx = self.alloc_scratch("v_idx", VLEN)  # reserves 8 consecutive scratch slots
-        v_val = self.alloc_scratch("v_val", VLEN)
-        v_node_val = self.alloc_scratch("v_node_val", VLEN)
+        # Single pipeline buffer - scale to N_BUFS
+        buf = self.alloc_buffer(0)
 
         self.batch_size = batch_size
 
@@ -263,99 +278,58 @@ class KernelBuilder:
                 b.alu("+", idx_addr, self.scratch["inp_indices_p"], self.get_const(0))
                 b.alu("+", val_addr, self.scratch["inp_values_p"], self.get_const(0))
 
-            for i in range(0, batch_size, VLEN): # block=8
+            for i in range(0, batch_size, VLEN):
+                global_step = round * batch_size + i
 
-                ## Load stage - 6 cycles: vload | alu gather addr | 4x gather
-                # ALU not used in compute stage, only load and store
-
-                # Load indices from current idx_addr
-                with self.bundle() as b:
-                    b.load("vload", v_idx, idx_addr)
-                    b.load("vload", v_val, val_addr)
-
-                with self.bundle() as b:
-                    b.debug("vcompare", v_idx, [(round, j, "idx") for j in range(i, i + VLEN)])
-
-                # Compute gather addrs + load values from val_addr
-                with self.bundle() as b:
-                    for j in range(VLEN):   # ALU engine (8 of 12 slots)
-                        b.alu("+", v_node_val + j, self.scratch["forest_values_p"], v_idx + j)
-
-                with self.bundle() as b:
-                    b.debug("vcompare", v_val, [(round, j, "val") for j in range(i, i + VLEN)])
-
-                for j in range(0, VLEN, 2): # 4 cycle for gather
+                # LOAD phase - 6 cycles via do_load
+                for step in range(6):
                     with self.bundle() as b:
-                        """
-                        2 loads per cycle, self-overwriting address with loaded value
-                        Load addr at v_node_val and store it at same location
-                        """
-                        b.load("load", v_node_val + j, v_node_val + j)
-                        b.load("load", v_node_val + j + 1, v_node_val + j + 1)
-
-                with self.bundle() as b:
-                    b.debug("vcompare", v_node_val, [(round, j, "node_val") for j in range(i, i + VLEN)])
+                        self.do_load(b, buf, step, global_step, idx_addr, val_addr)
 
                 ### Compute
-
                 # val = myhash(val ^ node_val)
                 with self.bundle() as b:
-                    b.valu("*", v_idx, v_idx, self.get_vconst(2)) # later used in the hashing
-                    b.valu("^", v_val, v_val, v_node_val)
-
+                    b.debug("vcompare", buf["v_node_val"], [(round, j, "node_val") for j in range(i, i + VLEN)])
+                    b.valu("*", buf["v_idx"], buf["v_idx"], self.get_vconst(2))
+                    b.valu("^", buf["v_val"], buf["v_val"], buf["v_node_val"])
 
                 # Sequential 6-stage hash. 12 cycles total.
-                # TODO: Pipeline with loads or interleave batches to use spare slots.
                 for stage in range(len(HASH_STAGES)):
                     with self.bundle() as b:
-                        """
-                        Hash stage first half: compute temps from val. (2 valu slots)
-                        Can run in parallel with loads or other work.
-                        """
                         op1, val1, op2, op3, val3 = HASH_STAGES[stage]
-                        b.valu(op1, v_tmp1, v_val, self.get_vconst(val1))
-                        b.valu(op3, v_tmp2, v_val, self.get_vconst(val3))
-
+                        b.valu(op1, buf["v_tmp1"], buf["v_val"], self.get_vconst(val1))
+                        b.valu(op3, buf["v_tmp2"], buf["v_val"], self.get_vconst(val3))
                     with self.bundle() as b:
-                        """
-                        Hash stage second half: combine temps into val. (1 valu slot)
-                        Depends on p1 completing in previous cycle.
-                        """
                         op1, val1, op2, op3, val3 = HASH_STAGES[stage]
-                        b.valu(op2, v_val, v_tmp1, v_tmp2)
+                        b.valu(op2, buf["v_val"], buf["v_tmp1"], buf["v_tmp2"])
 
                 with self.bundle() as b:
-                    b.debug("vcompare", v_val, [(round, j, "hashed_val") for j in range(i, i + VLEN)])
+                    b.debug("vcompare", buf["v_val"], [(round, j, "hashed_val") for j in range(i, i + VLEN)])
 
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
                 with self.bundle() as b:
-                    b.valu("%", v_tmp1, v_val, self.get_vconst(2))
+                    b.valu("%", buf["v_tmp1"], buf["v_val"], self.get_vconst(2))
                 with self.bundle() as b:
-                    b.valu("==", v_tmp1, v_tmp1, self.get_vconst(0))
+                    b.valu("==", buf["v_tmp1"], buf["v_tmp1"], self.get_vconst(0))
                 with self.bundle() as b:
-                    b.flow("vselect", v_tmp3, v_tmp1, self.get_vconst(1), self.get_vconst(2))
+                    b.flow("vselect", buf["v_tmp3"], buf["v_tmp1"], self.get_vconst(1), self.get_vconst(2))
                 with self.bundle() as b:
-                    b.valu("+", v_idx, v_idx, v_tmp3)
+                    b.valu("+", buf["v_idx"], buf["v_idx"], buf["v_tmp3"])
                 with self.bundle() as b:
-                    b.debug("vcompare", v_idx, [(round, j, "next_idx") for j in range(i, i + VLEN)])
+                    b.debug("vcompare", buf["v_idx"], [(round, j, "next_idx") for j in range(i, i + VLEN)])
                 # idx = 0 if idx >= n_nodes else idx
                 with self.bundle() as b:
-                    b.valu("<", v_tmp1, v_idx, self.get_vconst(n_nodes))
+                    b.valu("<", buf["v_tmp1"], buf["v_idx"], self.get_vconst(n_nodes))
                 with self.bundle() as b:
-                    b.flow("vselect", v_idx, v_tmp1, v_idx, self.get_vconst(0))
+                    b.flow("vselect", buf["v_idx"], buf["v_tmp1"], buf["v_idx"], self.get_vconst(0))
                 with self.bundle() as b:
-                    b.debug("vcompare", v_idx, [(round, j, "wrapped_idx") for j in range(i, i + VLEN)])
+                    b.debug("vcompare", buf["v_idx"], [(round, j, "wrapped_idx") for j in range(i, i + VLEN)])
 
-                # Store
-
-                # Store idx + advance idx_addr (self-overwriting: store reads old addr, ALU writes new)
+                # STORE - use saved addresses from do_load step 0
                 with self.bundle() as b:
-                    b.store("vstore", idx_addr, v_idx)
-                    b.alu("+", idx_addr, idx_addr, self.get_const(VLEN))
-                # Store val + advance val_addr
+                    b.store("vstore", buf["st_idx_addr"], buf["v_idx"])
                 with self.bundle() as b:
-                    b.store("vstore", val_addr, v_val)
-                    b.alu("+", val_addr, val_addr, self.get_const(VLEN))
+                    b.store("vstore", buf["st_val_addr"], buf["v_val"])
 
         # Required to match with the yield in reference_kernel2
         with self.bundle() as b:
