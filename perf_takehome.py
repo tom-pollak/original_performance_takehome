@@ -132,42 +132,6 @@ class KernelBuilder:
         debug: 64
 
         """
-        def gather_node_val(b, v_node_val, pair):
-            """
-            2 loads per cycle, self-overwriting address with loaded value
-            Load addr at v_node_val and store it at same location
-            """
-            j = pair * 2
-            b.load("load", v_node_val + j, v_node_val + j)
-            b.load("load", v_node_val + j + 1, v_node_val + j + 1)
-
-        def load_and_compute_next_addr(b, load_dest, addr_reg, next_base, offset):
-            """
-            Load from current addr_reg into load_dest (vload),
-            then overwrite addr_reg with next_base + offset for next cycle.
-            """
-            # val = mem[inp_values_p + i]
-            # v_addr is written to at the end of the cycle
-            b.load("vload", load_dest, addr_reg)
-            b.alu("+", addr_reg, next_base, offset)
-
-        def hash_p1(b, stage, v_val, v_tmp1, v_tmp2):
-            """
-            Hash stage first half: compute temps from val. (2 valu slots)
-            Can run in parallel with loads or other work.
-            """
-            op1, val1, op2, op3, val3 = HASH_STAGES[stage]
-            b.valu(op1, v_tmp1, v_val, self.get_vconst(val1))
-            b.valu(op3, v_tmp2, v_val, self.get_vconst(val3))
-
-        def hash_p2(b, stage, v_val, v_tmp1, v_tmp2):
-            """
-            Hash stage second half: combine temps into val. (1 valu slot)
-            Depends on p1 completing in previous cycle.
-            """
-            op1, val1, op2, op3, val3 = HASH_STAGES[stage]
-            b.valu(op2, v_val, v_tmp1, v_tmp2)
-
 
         v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
         v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
@@ -261,6 +225,7 @@ class KernelBuilder:
                 # Load indices from current idx_addr
                 with self.bundle() as b:
                     b.load("vload", v_idx, idx_addr)
+                    b.load("vload", v_val, val_addr)
 
                 with self.bundle() as b:
                     b.debug("vcompare", v_idx, [(round, j, "idx") for j in range(i, i + VLEN)])
@@ -269,16 +234,20 @@ class KernelBuilder:
                 with self.bundle() as b:
                     for j in range(VLEN):   # ALU engine (8 of 12 slots)
                         b.alu("+", v_node_val + j, self.scratch["forest_values_p"], v_idx + j)
-                    b.load("vload", v_val, val_addr)  # load engine
 
                     b.valu("*", v_idx, v_idx, self.get_vconst(2)) # later used in the hashing
 
                 with self.bundle() as b:
                     b.debug("vcompare", v_val, [(round, j, "val") for j in range(i, i + VLEN)])
 
-                for j in range(VLEN//2):
+                for j in range(0, VLEN, 2):
                     with self.bundle() as b:
-                        gather_node_val(b, v_node_val, j)
+                        """
+                        2 loads per cycle, self-overwriting address with loaded value
+                        Load addr at v_node_val and store it at same location
+                        """
+                        b.load("load", v_node_val + j, v_node_val + j)
+                        b.load("load", v_node_val + j + 1, v_node_val + j + 1)
 
                 with self.bundle() as b:
                     b.debug("vcompare", v_node_val, [(round, j, "node_val") for j in range(i, i + VLEN)])
@@ -287,13 +256,26 @@ class KernelBuilder:
                 with self.bundle() as b:
                     b.valu("^", v_val, v_val, v_node_val)
 
+
                 # Sequential 6-stage hash. 12 cycles total.
                 # TODO: Pipeline with loads or interleave batches to use spare slots.
                 for stage in range(len(HASH_STAGES)):
                     with self.bundle() as b:
-                        hash_p1(b, stage, v_val, v_tmp1, v_tmp2)
+                        """
+                        Hash stage first half: compute temps from val. (2 valu slots)
+                        Can run in parallel with loads or other work.
+                        """
+                        op1, val1, op2, op3, val3 = HASH_STAGES[stage]
+                        b.valu(op1, v_tmp1, v_val, self.get_vconst(val1))
+                        b.valu(op3, v_tmp2, v_val, self.get_vconst(val3))
+
                     with self.bundle() as b:
-                        hash_p2(b, stage, v_val, v_tmp1, v_tmp2)
+                        """
+                        Hash stage second half: combine temps into val. (1 valu slot)
+                        Depends on p1 completing in previous cycle.
+                        """
+                        op1, val1, op2, op3, val3 = HASH_STAGES[stage]
+                        b.valu(op2, v_val, v_tmp1, v_tmp2)
 
                 with self.bundle() as b:
                     b.debug("vcompare", v_val, [(round, j, "hashed_val") for j in range(i, i + VLEN)])
