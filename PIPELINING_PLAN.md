@@ -197,7 +197,48 @@ uv run python tests/submission_tests.py
 
 # Beyond-3,124 Optimization Strategies
 
-Target: ~1,400-1,800 cycles (~2x further improvement over period-6 pipeline).
+Target: ~1,300-1,400 cycles (matches README 1363). Period-4 single-round pipelining
+bottoms out around ~2,028 cycles, so we *must* reduce the number of per-round batches.
+
+## Strategy A: Fuse 2 rounds per batch (R=2)
+
+- Reorder loops so each batch processes two rounds back-to-back before storing.
+  The kernel’s per-element rounds are independent, so `for batch: for r in range(2): …`
+  is valid and cuts total batches from 512 → 256.
+- Keep `v_idx`/`v_val` in the per-buffer scratch across both rounds.
+  Only `vload` once at the start of round 1 and `vstore` once after round 2.
+- Add per-buffer `v_idx_addr` (VLEN scratch) and compute it at the *end* of round r
+  (after updating `v_idx`), so round r+1 load skips the dedicated address cycle.
+  This makes round-2 load = 4 gather cycles (no L1).
+- Expected per-batch phases (round 1 + round 2):
+  - Round 1 load: 6 cycles (vload + addr + 4 gathers)
+  - Round 1 compute: 18 cycles (17 if we use multiply_add, see below)
+  - Round 2 load: 4 cycles (gathers only; addr already computed)
+  - Round 2 compute: 18 cycles (17 if optimized)
+  - Store: 1 cycle
+- With 256 batches, if we can average ~5 cycles/batch initiation (via irregular schedule),
+  total cycles should land ~1,320–1,360 after overheads (close to 1363).
+
+## Strategy B: Replace fixed-period with a resource-constrained scheduler
+
+- The period-6 schedule is leaving throughput on the table because it assumes a
+  single fixed II. With R=2, load phases from round 2 can collide with round 1
+  of later batches, but we only need to avoid conflicts *when they actually occur*.
+- Build a small greedy scheduler at codegen time:
+  - Model each batch as a sequence of steps with dependencies and per-engine usage.
+  - Place each step at the earliest cycle where all required slots are free.
+  - This naturally yields a mostly-5-cycle initiation with occasional 6-cycle gaps
+    to dodge load conflicts between round-1 and round-2 gathers.
+- Net effect: average II ≈ 5 while respecting 2-load and 6-valu limits.
+
+## Strategy C: Shave compute cycles and free VALU slots
+
+- Use `valu("multiply_add")` to compute `idx = idx*2 + (val%2 + 1)` in 2 cycles
+  instead of 3:
+  - Cycle A: `tmp = val % 2` and `tmp = tmp + 1`
+  - Cycle B: `v_idx = multiply_add(v_idx, 2, tmp)`
+- The saved cycle helps both total latency and gives us a free VALU slot to compute
+  `v_idx_addr = v_idx + forest_values_p` at the tail of round compute.
 
 The fundamental bottleneck: 512 batches × 8 gather loads each = 4,096 gathers total.
 At 2 loads/cycle, that's a **2,048-cycle floor** just for gathers. Beating this requires
