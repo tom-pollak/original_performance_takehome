@@ -47,9 +47,8 @@ A VLIW SIMD machine simulator with these key properties:
   - `bundle()`: Context manager that creates a Bundle, yields it, and appends the resulting instruction dict to `self.instrs` on exit. Each `with self.bundle() as b:` block = one cycle.
   - `add(engine, slot)`: Shorthand for emitting a single-slot bundle (used during init/setup)
   - `build_kernel()`: Main entry point that constructs the computation loop
-  - `build_hash(b, ...)`: Adds 6-stage hash instructions to a given bundle `b`
   - `alloc_scratch()`: Manually allocates scratch memory; vector vars need `length=VLEN`
-  - `scratch_const()`: Allocates and deduplicates constants via `const_map`
+  - `alloc_const(b, val)` / `alloc_vconst(b, val)`: Allocate and deduplicate scalar/vector constants
 
 ### Computation
 For each round, for each batch element: load tree node at current index, XOR with value, hash the result, traverse left/right child based on hash parity, wrap at tree bounds. The hash function (`myhash`) is a 6-stage 32-bit operation using add, XOR, and shift.
@@ -59,38 +58,19 @@ Header (7 words): rounds, n_nodes, batch_size, forest_height, forest_values_p, i
 
 ## Current State
 
-Work in progress: migrating from scalar to SIMD (VLEN=8) vectorized kernel.
+Fully vectorized sequential kernel: **12,835 cycles** (11.5x over baseline).
 
-### Completed (lines 181-227)
-- **vload for indices and values** — 8 contiguous elements per load
-- **Gather for node_val** — self-overwriting scalar loads (see technique below)
-- **XOR** — `valu("^", v_val, v_val, v_node_val)`
-- **Hash** — `build_hash` now uses `valu` ops (but still passes scalar `tmp1`, `tmp2` — needs vector temps)
+### What's implemented
+- `alloc_buffer(buf_id)` — per-buffer scratch: v_idx, v_val, v_node_val, v_tmp1/2/3, st_idx/val_addr
+- `do_load(b, buf, step, global_step, idx_addr, val_addr)` — 6 steps (vload + 8 ALU addr + 4×2 gather)
+- `do_compute(b, buf, step, global_step)` — 18 steps (XOR, 6-stage hash, mod/mul/add branching, vselect wrap)
+- `do_store(b, buf, step, global_step)` — 1 step, store:2 (merged idx+val vstore)
+- `(val%2)+1` trick — eliminates eq+vselect, saves 1 compute step
+- Self-overwriting gather: `load v_node_val[i], v_node_val[i]` (address in = value out)
+- Sequential loop: 1 buffer, 16 rounds × 32 batches, 25 cycles/batch
 
-### Helper functions defined
-- `gather_node_val(b, v_node_val, pair)` — adds 2 scalar loads per call (load engine limit)
-- `load_and_compute_next_addr(b, load_dest, addr_reg, next_base, offset)` — overlaps vload with next address computation
-
-### Self-overwriting trick (gather)
-Uses same scratch slots for address and result: `load v_node_val[j], v_node_val[j]`
-- Reads use `core.scratch` (old value = address)
-- Writes go to `scratch_write` (applied at end of cycle = loaded value)
-- 8 ALU address ops merged with v_val vload (free cycle)
-- 4 bundles × 2 loads = 4 cycles for gather
-
-### Next: Vectorize remaining code (lines 229-260)
-Remaining scalar code references undefined `tmp_val`, `tmp_idx`, `tmp_addr`. Need to convert:
-- **Branch decision** (`% 2`, select): use `valu` + `flow("vselect", ...)`
-- **Wrap check** (`idx >= n_nodes`): use `valu` + `flow("vselect", ...)`
-- **Store back**: use `store("vstore", addr, data)` — addr is scalar, data is vector
-- **Constants for valu**: need vector versions via `valu("vbroadcast", v_const, scalar_const)`
-
-### Future: Software pipelining
-Batch iterations within a round are independent — can overlap:
-- **Load phase** (vloads + gather) uses load engine, ALU mostly idle
-- **Compute phase** (hash + branch + wrap) uses valu, load engine idle
-- Pipeline: load batch `i+1` while computing batch `i`
-- Requires double-buffered scratch vectors (`v_idx_A`/`v_idx_B`, etc.)
+### Next: Software pipelining → R=2 fusing
+See `ROADMAP.md` for the 4-step implementation plan targeting ~1,360 cycles.
 
 ## Critical Rules
 

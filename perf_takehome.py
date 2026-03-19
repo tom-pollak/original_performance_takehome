@@ -138,11 +138,10 @@ class KernelBuilder:
     def do_load(self, b, buf, step, global_step, idx_addr, val_addr):
         """
         LOAD stage - 6 cycles
-        ---
+
         vload v_idx, v_val + save addresses & advance global pointers for next cycle
         alu compute node_val gather addresses (8/12 slots)
         4x load cycles gathering node_val
-        ---
         """
         if step == 0:
             # load v_idx, v_val
