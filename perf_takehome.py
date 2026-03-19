@@ -122,51 +122,33 @@ class KernelBuilder:
         b.debug("vcompare", v, [(round, j, label) for j in range(i, i + VLEN)])
 
     def alloc_buffer(self, buf_id):
+        """Pipeline buffer: working scratch only. v_idx/v_val are set dynamically
+        per batch to point at the permanent scratch-resident arrays."""
         p = f"b{buf_id}_"
         return {
-            "v_idx": self.alloc_scratch(p + "v_idx", VLEN),
-            "v_val": self.alloc_scratch(p + "v_val", VLEN),
             "v_node_val": self.alloc_scratch(p + "v_node_val", VLEN),
             "v_tmp1": self.alloc_scratch(p + "v_tmp1", VLEN),
             "v_tmp2": self.alloc_scratch(p + "v_tmp2", VLEN),
             "v_tmp3": self.alloc_scratch(p + "v_tmp3", VLEN),
-            "st_idx_addr": self.alloc_scratch(p + "st_idx_addr"),
-            "st_val_addr": self.alloc_scratch(p + "st_val_addr"),
         }
 
 
-    def do_load(self, b, buf, step, global_step, idx_addr, val_addr):
+    def do_load(self, b, buf, step, global_step):
         """
-        LOAD stage - 6 cycles
+        LOAD stage - 5 cycles (scratch-resident: no vload/vstore needed)
 
-        vload v_idx, v_val + save addresses & advance global pointers for next cycle
-        alu compute node_val gather addresses (8/12 slots)
-        4x load cycles gathering node_val
+        Step 0: compute gather addresses (8 alu) + debug
+        Steps 1-4: gather node values (2 loads/cycle)
         """
         if step == 0:
-            # load v_idx, v_val
-            b.load("vload", buf["v_idx"], idx_addr)
-            b.load("vload", buf["v_val"], val_addr)
-            ## operates on old data
-            # save store addresses
-            b.alu("+", buf["st_idx_addr"], idx_addr, self.get_const(0))
-            b.alu("+", buf["st_val_addr"], val_addr, self.get_const(0))
-            # advance global pointers
-            b.alu("+", idx_addr, idx_addr, self.get_const(VLEN))
-            b.alu("+", val_addr, val_addr, self.get_const(VLEN))
-
-        elif step == 1:
             self.debug_vcompare(b, buf["v_idx"], "idx", global_step)
             self.debug_vcompare(b, buf["v_val"], "val", global_step)
-
-            # compute node_val addr
+            # compute node_val gather addresses: forest_values_p + idx[i]
             for i in range(VLEN):
                 b.alu("+", buf["v_node_val"] + i, self.scratch["forest_values_p"], buf["v_idx"] + i)
-
         else:
-            i = (step - 2) * 2 # compute our current gather pair
-            # 2 loads per cycle, self-overwriting address with loaded value
-            # Load addr at v_node_val and store it at same location
+            # gather 2 node values per cycle
+            i = (step - 1) * 2
             b.load("load", buf["v_node_val"] + i, buf["v_node_val"] + i)
             b.load("load", buf["v_node_val"] + i + 1, buf["v_node_val"] + i + 1)
 
@@ -177,53 +159,92 @@ class KernelBuilder:
             self.debug_vcompare(b, buf["v_node_val"], "node_val", global_step)
             b.valu("^", buf["v_val"], buf["v_val"], buf["v_node_val"])
 
-        elif step < 13:
-            i = (step - 1)
-            stage = i // 2
-            part = i % 2
-            if part == 0:
-                op1, val1, op2, op3, val3 = HASH_STAGES[stage]
+        elif step < 10:
+            # 9 hash steps: fuseable stages use multiply_add (1 step),
+            # non-fuseable use two parallel ops then combine (2 steps)
+            action, stage_idx = self.hash_schedule[step - 1]
+            op1, val1, op2, op3, val3 = HASH_STAGES[stage_idx]
+            if action == "fused":
+                mul_const = (1 << val3) + 1
+                b.valu("multiply_add", buf["v_val"], buf["v_val"], self.get_vconst(mul_const), self.get_vconst(val1))
+            elif action == "part0":
                 b.valu(op1, buf["v_tmp1"], buf["v_val"], self.get_vconst(val1))
                 b.valu(op3, buf["v_tmp2"], buf["v_val"], self.get_vconst(val3))
-            else:
-                op1, val1, op2, op3, val3 = HASH_STAGES[stage]
+            elif action == "part1":
                 b.valu(op2, buf["v_val"], buf["v_tmp1"], buf["v_tmp2"])
 
         # idx = 2*idx + ((val % 2) + 1)  -- note: 0→1, 1→2 replaces eq+vselect
-        elif step == 13:
+        elif step == 10:
             self.debug_vcompare(b, buf["v_val"], "hashed_val", global_step)
             b.valu("%", buf["v_tmp1"], buf["v_val"], self.get_vconst(2))
             b.valu("*", buf["v_idx"], buf["v_idx"], self.get_vconst(2))
-        elif step == 14:
+        elif step == 11:
             b.valu("+", buf["v_tmp1"], buf["v_tmp1"], self.get_vconst(1))
-        elif step == 15:
+        elif step == 12:
             b.valu("+", buf["v_idx"], buf["v_idx"], buf["v_tmp1"])
         # idx = 0 if idx >= n_nodes else idx
-        elif step == 16:
+        elif step == 13:
             self.debug_vcompare(b, buf["v_idx"], "next_idx", global_step)
             b.valu("<", buf["v_tmp1"], buf["v_idx"], self.get_vconst(self.n_nodes))
-        elif step == 17:
+        elif step == 14:
             b.flow("vselect", buf["v_idx"], buf["v_tmp1"], buf["v_idx"], self.get_vconst(0))
 
-    def do_store(self, b, buf, step, global_step):
-        b.debug(b, buf["v_idx"], "wrapped_idx", global_step)
-        b.store("vstore", buf["st_idx_addr"], buf["v_idx"])
-        b.store("vstore", buf["st_val_addr"], buf["v_val"])
+    def build_schedule(self, batch_size: int, rounds: int):
+        LOAD_STEPS = 5   # addr compute (8 alu) + 4 gather cycles (2 load each)
+        COMPUTE_STEPS = 15  # XOR + 9 hash + 5 branch/wrap
+        TOTAL_STEPS = LOAD_STEPS + COMPUTE_STEPS  # 20 cycles per batch (no store)
+        PERIOD = 4   # gather-limited: 4 load steps use 2/2 slots each
+        N_BUFS = 5   # ceil(20/4) = 5 buffers in flight
+
+        bufs = [self.alloc_buffer(i) for i in range(N_BUFS)]
+
+        batches_per_round = batch_size // VLEN
+        total_batches = rounds * batches_per_round
+
+        # Each batch occupies 20 cycles, staggered by PERIOD=4.
+        # No resets needed: idx/val live in scratch across all rounds.
+        #
+        #  cycle:  0  1  2  3  4  5  6  7  8  9 ...
+        #  bat 0: L0 L1 L2 L3 L4 C0 C1 C2 C3 C4 ...
+        #  bat 1:             L0 L1 L2 L3 L4 C0 C1 ...
+        #
+        # Steady state (5 in-flight), resources per offset:
+        # off | steps                     | load(2) | alu(12) | valu(6) | flow(1)
+        #  0  | L0, L4, C3, C7, C11       |    2    |    8    |    3    |    0
+        #  1  | L1, C0, C4, C8, C12       |    2    |    0    |    5    |    0
+        #  2  | L2, C1, C5, C9, C13       |    2    |    0    |    5    |    0
+        #  3  | L3, C2, C6, C10, C14      |    2    |    0    |    5    |    1
+        schedule = defaultdict(list)
+        t = 0
+
+        for batch in range(total_batches):
+            buf_idx = batch % N_BUFS
+            round_num = batch // batches_per_round
+            batch_in_round = batch % batches_per_round
+            gs = round_num * batch_size + batch_in_round * VLEN
+
+            for s in range(LOAD_STEPS):
+                schedule[t + s].append(("load", buf_idx, s, gs, batch_in_round))
+            for s in range(COMPUTE_STEPS):
+                schedule[t + LOAD_STEPS + s].append(("compute", buf_idx, s, gs, batch_in_round))
+
+            t += PERIOD
+        return bufs, schedule
+
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Vectorized pipelined kernel with scratch-resident idx/val.
 
-        alu: 12
-        valu: 6
-        load: 2
-        store: 2
-        flow: 1
-        debug: 64
+        All 32 batch vectors live permanently in scratch across rounds.
+        Bulk vload at start, pipelined compute (period-4), bulk vstore at end.
 
+        Per-batch pipeline: 5 load + 15 compute = 20 cycles latency.
+        Period 4, 5 buffers in flight. No per-batch store or round resets.
+
+        Engine limits: alu(12), valu(6), load(2), store(2), flow(1), debug(64)
         """
 
         # Constants for init_vars (indices 0-6)
@@ -265,10 +286,23 @@ class KernelBuilder:
 
         ### HASH CONSTS
         hash_consts = set()
-        for _, val1, _, _, val3 in HASH_STAGES:
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
             hash_consts.add(val1)
-            hash_consts.add(val3)
+            if op2 == "+" and op3 == "<<":
+                # Fuseable: (a + val1) + (a << val3) = a * (2^val3 + 1) + val1
+                hash_consts.add((1 << val3) + 1)
+            else:
+                hash_consts.add(val3)
         hash_consts = list(hash_consts)
+
+        # Build hash schedule: fuseable stages take 1 step, others take 2
+        self.hash_schedule = []
+        for stage_idx, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            if op2 == "+" and op3 == "<<":
+                self.hash_schedule.append(("fused", stage_idx))
+            else:
+                self.hash_schedule.append(("part0", stage_idx))
+                self.hash_schedule.append(("part1", stage_idx))
 
         ## To make vconsts, we must first load them as consts
         for chunk in range(0, len(hash_consts), 2): # 2 loads per cycle
@@ -296,50 +330,54 @@ class KernelBuilder:
             # Any debug engine instruction is ignored by the submission simulator
             b.debug("comment", "Starting loop")
 
-        # Scratch registers for maintained addresses
-        idx_addr = self.alloc_scratch("idx_addr")
-        val_addr = self.alloc_scratch("val_addr")
-
-        # Single pipeline buffer - scale to N_BUFS
-        buf = self.alloc_buffer(0)
-
         self.batch_size = batch_size
         self.n_nodes = n_nodes
+        batches_per_round = batch_size // VLEN  # 32
 
-        #  off | valu(6) | Batches
-        #   0  |    3    | L0, C0, C6, C12, S0
-        #   1  |    6    | L1, C1, C7, C13, S1
-        #   2  |    3    | L2, C2, C8, C14
-        #   3  |    5    | L3, C3, C9, C15
-        #   4  |    3    | L4, C4, C10, C16
-        #   5  |    4    | L5, C5, C11, C17
-        for round in range(rounds):
-            # Reset base addresses for this round
+        # Permanent scratch-resident arrays for all batch elements.
+        # These persist across all 16 rounds — no per-batch vload/vstore needed.
+        perm_idx = [self.alloc_scratch(f"perm_idx_{i}", VLEN) for i in range(batches_per_round)]
+        perm_val = [self.alloc_scratch(f"perm_val_{i}", VLEN) for i in range(batches_per_round)]
+
+        # Bulk load all idx/val from memory into scratch (32 cycles, 2 vloads/cycle)
+        bulk_idx_addr = self.alloc_scratch("bulk_idx_addr")
+        bulk_val_addr = self.alloc_scratch("bulk_val_addr")
+        with self.bundle() as b:
+            b.alu("+", bulk_idx_addr, self.scratch["inp_indices_p"], self.get_const(0))
+            b.alu("+", bulk_val_addr, self.scratch["inp_values_p"], self.get_const(0))
+        for i in range(batches_per_round):
             with self.bundle() as b:
-                b.alu("+", idx_addr, self.scratch["inp_indices_p"], self.get_const(0))
-                b.alu("+", val_addr, self.scratch["inp_values_p"], self.get_const(0))
+                b.load("vload", perm_idx[i], bulk_idx_addr)
+                b.load("vload", perm_val[i], bulk_val_addr)
+                b.alu("+", bulk_idx_addr, bulk_idx_addr, self.get_const(VLEN))
+                b.alu("+", bulk_val_addr, bulk_val_addr, self.get_const(VLEN))
 
-            for i in range(0, batch_size, VLEN):
-                global_step = round * batch_size + i
+        # Build and emit pipeline schedule
+        bufs, schedule = self.build_schedule(batch_size, rounds)
 
-                # LOAD
-                for step in range(6):
-                    # vload, 8alu, 4x [2load]
-                    with self.bundle() as b:
-                        self.do_load(b, buf, step, global_step, idx_addr, val_addr)
+        for cy in sorted(schedule.keys()):
+            with self.bundle() as b:
+                for op in schedule[cy]:
+                    match op:
+                        case ("load", buf_idx, step, gs, bir):
+                            bufs[buf_idx]["v_idx"] = perm_idx[bir]
+                            bufs[buf_idx]["v_val"] = perm_val[bir]
+                            self.do_load(b, bufs[buf_idx], step, gs)
+                        case ("compute", buf_idx, step, gs, bir):
+                            bufs[buf_idx]["v_idx"] = perm_idx[bir]
+                            bufs[buf_idx]["v_val"] = perm_val[bir]
+                            self.do_compute(b, bufs[buf_idx], step, gs)
 
-                # COMPUTE
-                for step in range(18):
-                    # 1valu (XOR)
-                    # 6x [2valu, 1valu] (hash)
-                    # 2valu (mod+mul), 1valu (+1), 1valu (add), 1valu (lt), 1flow (wrap)
-                    with self.bundle() as b:
-                        self.do_compute(b, buf, step, global_step)
-
-                # STORE
-                # 2store
-                with self.bundle() as b:
-                    self.do_store(b, buf, step=0, global_step=global_step)
+        # Bulk store val (and idx) back to memory (32 cycles, 2 vstores/cycle)
+        with self.bundle() as b:
+            b.alu("+", bulk_idx_addr, self.scratch["inp_indices_p"], self.get_const(0))
+            b.alu("+", bulk_val_addr, self.scratch["inp_values_p"], self.get_const(0))
+        for i in range(batches_per_round):
+            with self.bundle() as b:
+                b.store("vstore", bulk_idx_addr, perm_idx[i])
+                b.store("vstore", bulk_val_addr, perm_val[i])
+                b.alu("+", bulk_idx_addr, bulk_idx_addr, self.get_const(VLEN))
+                b.alu("+", bulk_val_addr, bulk_val_addr, self.get_const(VLEN))
 
         # Required to match with the yield in reference_kernel2
         with self.bundle() as b:
